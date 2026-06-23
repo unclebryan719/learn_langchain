@@ -1,5 +1,6 @@
 # 基于 langgraph 部署智能体，适用于本地调试
 import asyncio
+import json
 import os
 import sqlite3
 
@@ -24,7 +25,12 @@ model = init_chat_model(
     extra_body={"enable_thinking": False},
 )
 
-web_search = TavilySearch(max_results=3, topic="general")
+web_search = TavilySearch(
+    max_results=5,
+    topic="general",
+    include_images=True,
+    include_image_descriptions=True,
+)
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 db_dir = os.path.join(current_dir, "..", "..", "db")
@@ -41,6 +47,9 @@ system_prompt = """
 2. 结合下方提供的网络检索结果，筛选可行菜谱。
 3. 从营养价值和制作难度两个维度对候选食谱进行量化打分并排序。
 4. 输出结构清晰的建议报告，包含食谱信息、得分、推荐理由。
+5. 每个推荐食谱必须附带参考图片：优先使用「网络检索参考信息」中「相关图片」里的 URL，
+   用 Markdown 格式单独一行输出，例如：![番茄炒蛋](https://example.com/image.jpg)
+   若检索结果中没有与菜名匹配的图片，可省略该菜的图片，但不得编造 URL。
 不要调用任何工具，直接基于已有信息回答。
 """
 
@@ -70,12 +79,71 @@ def _extract_text(content) -> str:
     return str(content)
 
 
+def _build_search_query(prompt: str) -> str:
+    base = prompt.strip() if prompt and prompt.strip() else "家常菜谱推荐"
+    return f"{base} 做法 步骤 成品图"
+
+
+def _format_image_entry(image) -> str | None:
+    if isinstance(image, str) and image.strip():
+        return image.strip()
+    if isinstance(image, dict):
+        url = (image.get("url") or image.get("src") or "").strip()
+        if not url:
+            return None
+        description = (
+            image.get("description") or image.get("alt") or image.get("title") or "参考图"
+        ).strip()
+        return f"{description}: {url}"
+    return None
+
+
+def _format_search_result(result) -> str:
+    if isinstance(result, str):
+        return result
+    if not isinstance(result, dict):
+        return str(result)
+
+    if result.get("error"):
+        return f"搜索出错: {result['error']}"
+
+    lines: list[str] = []
+    answer = result.get("answer")
+    if answer:
+        lines.append(f"摘要: {answer}")
+
+    lines.append("搜索结果:")
+    for index, item in enumerate(result.get("results", []), start=1):
+        title = item.get("title", "未知标题")
+        url = item.get("url", "")
+        content = item.get("content", "")
+        lines.append(f"{index}. {title}")
+        if url:
+            lines.append(f"   链接: {url}")
+        if content:
+            lines.append(f"   内容: {content}")
+
+    image_lines = [
+        formatted
+        for image in result.get("images") or []
+        if (formatted := _format_image_entry(image))
+    ]
+    if image_lines:
+        lines.append("相关图片（请为对应食谱选用以下 URL，并用 Markdown 图片语法展示）:")
+        lines.extend(f"- {line}" for line in image_lines)
+    else:
+        lines.append("相关图片: 本次检索未返回可用图片。")
+
+    return "\n".join(lines)
+
+
 def _build_user_text(prompt: str, search_result: str) -> str:
     user_question = prompt.strip() if prompt and prompt.strip() else "请根据图片中的食材推荐菜谱。"
     return (
         f"用户问题：{user_question}\n\n"
         f"网络检索参考信息：\n{search_result}\n\n"
-        "请基于以上信息，输出完整的食谱推荐报告。"
+        "请基于以上信息，输出完整的食谱推荐报告；"
+        "每个食谱需包含 Markdown 格式的参考图片（若检索结果中有匹配图片）。"
     )
 
 
@@ -107,9 +175,17 @@ def _persist_turn(thread_id: str, user_message: HumanMessage, assistant_message:
 
 
 async def _run_web_search(prompt: str) -> str:
-    query = prompt.strip() if prompt and prompt.strip() else "常见家常菜谱"
+    query = _build_search_query(prompt)
     result = await asyncio.to_thread(web_search.invoke, {"query": query})
-    return str(result)
+    formatted = _format_search_result(result)
+    logger.info(
+        "[Tavily] query=%r image_count=%s",
+        query,
+        len(result.get("images", [])) if isinstance(result, dict) else 0,
+    )
+    if logger.isEnabledFor(10):
+        logger.debug("[Tavily raw] %s", json.dumps(result, ensure_ascii=False)[:2000])
+    return formatted
 
 
 async def search_recipes(prompt: str, image: str | None, thread_id: str):

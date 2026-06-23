@@ -243,48 +243,259 @@ class ChatApp {
         return messageDiv;
     }
 
-    // Markdown 渲染函数
+    // Markdown 渲染：块级解析 + 行内样式
     renderMarkdown(text) {
-        // 转义 HTML
+        const blocks = this.parseMarkdownBlocks(text.trim());
+        return blocks.join('\n');
+    }
+
+    parseMarkdownBlocks(text) {
+        const lines = text.split('\n');
+        const html = [];
+        let i = 0;
+
+        while (i < lines.length) {
+            const line = lines[i];
+
+            if (!line.trim()) {
+                i += 1;
+                continue;
+            }
+
+            // 代码块
+            if (line.trim().startsWith('```')) {
+                const fence = line.trim().slice(3).trim();
+                const codeLines = [];
+                i += 1;
+                while (i < lines.length && !lines[i].trim().startsWith('```')) {
+                    codeLines.push(lines[i]);
+                    i += 1;
+                }
+                i += 1;
+                html.push(`<pre><code>${this.escapeHtml(codeLines.join('\n'))}</code></pre>`);
+                continue;
+            }
+
+            // 表格（GFM）
+            if (this.isTableRow(line)) {
+                const tableLines = [];
+                while (i < lines.length && this.isTableRow(lines[i])) {
+                    tableLines.push(lines[i]);
+                    i += 1;
+                }
+                html.push(this.renderTable(tableLines));
+                continue;
+            }
+
+            // 分隔线
+            if (/^(-{3,}|\*{3,}|_{3,})$/.test(line.trim())) {
+                html.push('<hr/>');
+                i += 1;
+                continue;
+            }
+
+            // 标题
+            const heading = line.match(/^(#{1,6})\s+(.+)$/);
+            if (heading) {
+                const level = heading[1].length;
+                html.push(`<h${level}>${this.renderInlineMarkdown(heading[2])}</h${level}>`);
+                i += 1;
+                continue;
+            }
+
+            // 引用
+            if (line.trim().startsWith('>')) {
+                const quoteLines = [];
+                while (i < lines.length && lines[i].trim().startsWith('>')) {
+                    quoteLines.push(lines[i].trim().replace(/^>\s?/, ''));
+                    i += 1;
+                }
+                html.push(`<blockquote>${this.renderInlineMarkdown(quoteLines.join('\n'))}</blockquote>`);
+                continue;
+            }
+
+            // 无序列表：行首 * / - / + 渲染为圆点列表（允许前导空格）
+            if (this.isUnorderedListItem(line)) {
+                const items = [];
+                while (i < lines.length) {
+                    if (this.isUnorderedListItem(lines[i])) {
+                        items.push(this.getUnorderedListItemContent(lines[i]));
+                        i += 1;
+                        continue;
+                    }
+                    // 列表项之间允许空一行
+                    if (!lines[i].trim() && i + 1 < lines.length && this.isUnorderedListItem(lines[i + 1])) {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                html.push(`<ul>${items.map(item => `<li>${this.renderInlineMarkdown(item)}</li>`).join('')}</ul>`);
+                continue;
+            }
+
+            // 有序列表：至少连续 2 行才视为列表，避免把 "1. 标题" 误判为 ol
+            if (this.isOrderedListItem(line)) {
+                const sectionTitle = line.trim();
+                const items = [];
+                while (i < lines.length) {
+                    if (this.isOrderedListItem(lines[i])) {
+                        items.push(this.getOrderedListItemContent(lines[i]));
+                        i += 1;
+                        continue;
+                    }
+                    if (!lines[i].trim() && i + 1 < lines.length && this.isOrderedListItem(lines[i + 1])) {
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                if (items.length >= 2) {
+                    html.push(`<ol>${items.map(item => `<li>${this.renderInlineMarkdown(item)}</li>`).join('')}</ol>`);
+                } else {
+                    html.push(`<p class="md-section-title">${this.renderInlineMarkdown(sectionTitle)}</p>`);
+                }
+                continue;
+            }
+
+            // 分类小标题，如「蛋白质类：」
+            if (this.isCategoryHeading(line, lines[i + 1])) {
+                html.push(`<p class="md-category">${this.renderInlineMarkdown(line.trim())}</p>`);
+                i += 1;
+                continue;
+            }
+
+            // 普通段落（合并连续非空行）
+            const paraLines = [];
+            while (
+                i < lines.length &&
+                lines[i].trim() &&
+                !this.isTableRow(lines[i]) &&
+                !lines[i].trim().startsWith('```') &&
+                !/^(#{1,6})\s+/.test(lines[i].trim()) &&
+                !/^(-{3,}|\*{3,}|_{3,})$/.test(lines[i].trim()) &&
+                !lines[i].trim().startsWith('>') &&
+                !this.isUnorderedListItem(lines[i]) &&
+                !this.isOrderedListItem(lines[i]) &&
+                !this.isCategoryHeading(lines[i], lines[i + 1])
+            ) {
+                paraLines.push(lines[i]);
+                i += 1;
+            }
+            html.push(`<p>${this.renderInlineMarkdown(paraLines.join('\n'))}</p>`);
+        }
+
+        return html;
+    }
+
+    isUnorderedListItem(line) {
+        return /^\s*[\*\-+•]\s+/.test(line);
+    }
+
+    getUnorderedListItemContent(line) {
+        return line.replace(/^\s*[\*\-+•]\s+/, '');
+    }
+
+    isOrderedListItem(line) {
+        return /^\s*\d+\.\s+/.test(line);
+    }
+
+    getOrderedListItemContent(line) {
+        return line.replace(/^\s*\d+\.\s+/, '');
+    }
+
+    isCategoryHeading(line, nextLine) {
+        const trimmed = line.trim();
+        if (!trimmed || this.isUnorderedListItem(line) || this.isOrderedListItem(line)) {
+            return false;
+        }
+        if (!/[：:]$/.test(trimmed)) {
+            return false;
+        }
+        return nextLine !== undefined && this.isUnorderedListItem(nextLine);
+    }
+
+    isTableRow(line) {
+        const trimmed = line.trim();
+        return trimmed.startsWith('|') && trimmed.endsWith('|') && trimmed.includes('|');
+    }
+
+    isTableSeparator(line) {
+        const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+        const cells = trimmed.split('|').map(cell => cell.trim());
+        return cells.length > 0 && cells.every(cell => /^:?-{3,}:?$/.test(cell));
+    }
+
+    parseTableRow(line) {
+        const trimmed = line.trim().replace(/^\|/, '').replace(/\|$/, '');
+        return trimmed.split('|').map(cell => cell.trim());
+    }
+
+    renderTable(tableLines) {
+        if (tableLines.length < 2) {
+            return `<p>${this.renderInlineMarkdown(tableLines.join('\n'))}</p>`;
+        }
+
+        let headerCells = this.parseTableRow(tableLines[0]);
+        let bodyStart = 1;
+
+        if (this.isTableSeparator(tableLines[1])) {
+            bodyStart = 2;
+        }
+
+        const bodyRows = tableLines.slice(bodyStart).map(row => this.parseTableRow(row));
+        const colCount = headerCells.length;
+
+        const normalizeCells = (cells) => {
+            const result = cells.slice(0, colCount);
+            while (result.length < colCount) {
+                result.push('');
+            }
+            return result;
+        };
+
+        headerCells = normalizeCells(headerCells);
+
+        const thead = `<thead><tr>${headerCells
+            .map(cell => `<th>${this.renderInlineMarkdown(cell)}</th>`)
+            .join('')}</tr></thead>`;
+
+        const tbody = bodyRows.length
+            ? `<tbody>${bodyRows
+                  .map(cells => {
+                      const normalized = normalizeCells(cells);
+                      return `<tr>${normalized
+                          .map(cell => `<td>${this.renderInlineMarkdown(cell)}</td>`)
+                          .join('')}</tr>`;
+                  })
+                  .join('')}</tbody>`
+            : '';
+
+        return `<div class="md-table-wrapper"><table class="md-table">${thead}${tbody}</table></div>`;
+    }
+
+    renderInlineMarkdown(text) {
         let html = this.escapeHtml(text);
-        
-        // 处理分隔线
-        html = html.replace(/^---$/gm, '<hr/>');
-        
-        // 处理标题
-        html = html.replace(/^#### (.+)$/gm, '<h4>$1</h4>');
-        html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
-        html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
-        html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
-        
-        // 处理无序列表
-        html = html.replace(/^[\*\-] (.+)$/gm, '<li>$1</li>');
-        html = html.replace(/(<li>.*?<\/li>)/gs, '<ul>$1</ul>');
-        
-        // 处理有序列表
-        html = html.replace(/^\d+\. (.+)$/gm, '<li>$1</li>');
-        
-        // 处理粗体
-        html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-        
-        // 处理斜体
-        html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-        
-        // 处理引用
-        html = html.replace(/^> (.+)$/gm, '<blockquote>$1</blockquote>');
-        
-        // 处理代码（行内）
-        html = html.replace(/`(.+?)`/g, '<code>$1</code>');
-        
-        // 处理代码块
-        html = html.replace(/```([\s\S]*?)```/g, '<pre><code>$1</code></pre>');
-        
-        // 处理链接
-        html = html.replace(/\[(.+?)\]\((.+?)\)/g, '<a href="$2" target="_blank">$1</a>');
-        
-        // 处理换行
+
+        // 图片 ![alt](url)
+        html = html.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, '<img src="$2" alt="$1" class="md-image" loading="lazy" />');
+
+        // 链接 [text](url)
+        html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+
+        // 行内代码
+        html = html.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+
+        // 粗体 **text**
+        html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+
+        // 斜体 *text* 或 _text_（避免匹配列表标记）
+        html = html.replace(/(?<![\\\*])\*([^*\n]+)\*(?!\*)/g, '<em>$1</em>');
+        html = html.replace(/(?<!\\)_([^_\n]+)_/g, '<em>$1</em>');
+
+        // 换行
         html = html.replace(/\n/g, '<br/>');
-        
+
         return html;
     }
 

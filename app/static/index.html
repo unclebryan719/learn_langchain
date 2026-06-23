@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>智能私人厨师</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🍳 智能私人厨师</h1>
+            <p>上传食材照片或输入食材清单，我来为您推荐美味食谱</p>
+        </header>
+        
+        <div class="chat-container">
+            <div class="message-list" id="messageList">
+                <!-- 消息列表 -->
+            </div>
+            
+            <div class="input-area">
+                <div class="image-upload">
+                    <input type="file" id="imageInput" accept="image/*" hidden>
+                    <label for="imageInput" class="upload-btn">📷 上传图片</label>
+                    <span id="imagePreview"></span>
+                </div>
+                
+                <div class="input-row">
+                    <input type="text" id="messageInput" placeholder="输入食材清单或问题..." />
+                    <button id="sendBtn" class="send-btn">发送</button>
+                </div>
+                
+                <button id="clearBtn" class="clear-btn">🗑️ 清空对话</button>
+            </div>
+        </div>
+        
+        <div class="loading-overlay" id="loadingOverlay" style="display: none;">
+            <div class="loading-spinner"></div>
+            <p>正在搜索食谱...</p>
+        </div>
+    </div>
+    
+    <script src="app.js"></script>
+</body>
+</html>

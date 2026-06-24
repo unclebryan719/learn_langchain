@@ -53,6 +53,19 @@ system_prompt = """
 不要调用任何工具，直接基于已有信息回答。
 """
 
+search_plan_prompt = """
+你是搜索查询规划助手。根据对话历史和用户最新问题，决定是否调用 Tavily 联网搜索，并生成具体搜索词。
+
+规则：
+1. 用户说「第N道菜 / 第一个推荐 / 上面那道」等指代时，必须先从历史中解析出具体菜名，
+   再用「菜名 + 做法/步骤/详细教程」作为 query，禁止直接搜索「第二道菜」等指代词。
+2. 首次问「能做什么菜」、上传食材、列出食材清单时，need_search=true，query 基于食材或用户描述。
+3. 用户只是确认、闲聊、或问题已能仅凭对话历史完整回答时，need_search=false。
+4. query 必须是可直接用于搜索引擎的具体中文关键词，可含菜名、做法、步骤、成品图等。
+5. 只输出一个 JSON 对象，不要 markdown 代码块，格式：
+{"need_search": true, "query": "番茄炒蛋 详细做法 步骤"}
+"""
+
 # 仅用于 checkpoint 读写，不在流式阶段调用 graph 推理
 agent = create_agent(
     model=model,
@@ -82,6 +95,46 @@ def _extract_text(content) -> str:
 def _build_search_query(prompt: str) -> str:
     base = prompt.strip() if prompt and prompt.strip() else "家常菜谱推荐"
     return f"{base} 做法 步骤 成品图"
+
+
+def _parse_json_object(text: str) -> dict:
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1]
+        if text.endswith("```"):
+            text = text.rsplit("```", 1)[0]
+        text = text.strip()
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("响应中未找到 JSON 对象")
+    return json.loads(text[start : end + 1])
+
+
+async def _plan_web_search(prompt: str, history: list) -> tuple[bool, str | None]:
+    user_question = prompt.strip() if prompt and prompt.strip() else "请根据图片中的食材推荐菜谱。"
+
+    if not history:
+        return True, _build_search_query(user_question)
+
+    planner_messages = [
+        SystemMessage(content=search_plan_prompt),
+        *history[-8:],
+        HumanMessage(content=f"用户最新问题：{user_question}"),
+    ]
+    response = await model.ainvoke(planner_messages)
+    try:
+        plan = _parse_json_object(_extract_text(response.content))
+    except (ValueError, json.JSONDecodeError) as e:
+        logger.warning("[搜索规划] 解析失败: %s，跳过联网搜索", e)
+        return False, None
+
+    need_search = bool(plan.get("need_search"))
+    query = (plan.get("query") or "").strip() or None
+    if need_search and not query:
+        need_search = False
+    logger.info("[搜索规划] need_search=%s query=%r", need_search, query)
+    return need_search, query
 
 
 def _format_image_entry(image) -> str | None:
@@ -137,18 +190,24 @@ def _format_search_result(result) -> str:
     return "\n".join(lines)
 
 
-def _build_user_text(prompt: str, search_result: str) -> str:
+def _build_user_text(prompt: str, search_result: str, searched: bool) -> str:
     user_question = prompt.strip() if prompt and prompt.strip() else "请根据图片中的食材推荐菜谱。"
-    return (
-        f"用户问题：{user_question}\n\n"
-        f"网络检索参考信息：\n{search_result}\n\n"
-        "请基于以上信息，输出完整的食谱推荐报告；"
-        "每个食谱需包含 Markdown 格式的参考图片（若检索结果中有匹配图片）。"
-    )
+    if searched:
+        reference = f"网络检索参考信息：\n{search_result}\n\n"
+        tail = (
+            "请基于以上信息，输出完整的食谱推荐报告；"
+            "每个食谱需包含 Markdown 格式的参考图片（若检索结果中有匹配图片）。"
+        )
+    else:
+        reference = f"{search_result}\n\n"
+        tail = "请结合对话历史直接回答用户问题，无需重复完整推荐列表。"
+    return f"用户问题：{user_question}\n\n{reference}{tail}"
 
 
-def _build_human_message(prompt: str, image: str | None, search_result: str) -> HumanMessage:
-    text = _build_user_text(prompt, search_result)
+def _build_human_message(
+    prompt: str, image: str | None, search_result: str, searched: bool
+) -> HumanMessage:
+    text = _build_user_text(prompt, search_result, searched)
     if not image or not image.strip():
         return HumanMessage(content=text)
 
@@ -174,8 +233,7 @@ def _persist_turn(thread_id: str, user_message: HumanMessage, assistant_message:
     agent.update_state(config, {"messages": [user_message, assistant_message]})
 
 
-async def _run_web_search(prompt: str) -> str:
-    query = _build_search_query(prompt)
+async def _run_web_search(query: str) -> str:
     result = await asyncio.to_thread(web_search.invoke, {"query": query})
     formatted = _format_search_result(result)
     logger.info(
@@ -188,17 +246,27 @@ async def _run_web_search(prompt: str) -> str:
     return formatted
 
 
+NO_SEARCH_HINT = "（本次无需额外网络检索，请结合上文对话历史回答用户问题。）"
+
+
 async def search_recipes(prompt: str, image: str | None, thread_id: str):
-    """Tavily 搜索 + 单次大模型流式输出（只调用 1 次 LLM）。"""
+    """搜索规划 + Tavily（按需）+ 单次大模型流式输出。"""
     logger.info(f"[用户]: {prompt}, image: {image}, thread_id: {thread_id}")
     try:
-        yield "🔍 正在搜索食谱，请稍候...\n\n"
-
-        search_result = await _run_web_search(prompt)
-        logger.info(f"[搜索完成] thread_id={thread_id}")
-
-        user_message = _build_human_message(prompt, image, search_result)
         history = await asyncio.to_thread(_get_history_messages, thread_id)
+        need_search, query = await _plan_web_search(prompt, history)
+
+        if need_search and query:
+            yield "🔍 正在搜索食谱，请稍候...\n\n"
+            search_result = await _run_web_search(query)
+            logger.info(f"[搜索完成] thread_id={thread_id}")
+            searched = True
+        else:
+            search_result = NO_SEARCH_HINT
+            searched = False
+            logger.info(f"[跳过搜索] thread_id={thread_id}")
+
+        user_message = _build_human_message(prompt, image, search_result, searched)
         llm_messages = [SystemMessage(content=system_prompt), *history, user_message]
 
         full_parts: list[str] = []
